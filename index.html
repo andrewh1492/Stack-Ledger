@@ -207,7 +207,8 @@ a.btn{text-decoration:none;color:var(--ink)}
 .field{display:flex;flex-direction:column;gap:5px;min-width:0}
 .field label{font-size:13px;font-weight:500;color:var(--muted)}
 .two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px}
-input[type=text],input[type=number],input[type=date],select{width:100%;border:1px solid var(--line);background:var(--surface-2);border-radius:8px;padding:9px 11px;min-width:0}
+.btn.sync-err{color:var(--down);border-color:var(--down)}
+input[type=text],input[type=password],input[type=number],input[type=date],select{width:100%;border:1px solid var(--line);background:var(--surface-2);border-radius:8px;padding:9px 11px;min-width:0}
 input.num{font-family:var(--f-mono)}
 .swatches{display:flex;gap:8px;flex-wrap:wrap}
 .swatches label{width:28px;height:28px;border-radius:7px;cursor:pointer;position:relative}
@@ -235,7 +236,7 @@ input.num{font-family:var(--f-mono)}
     </a>
     <span class="spacer"></span>
     <button class="btn ghost" id="btn-refresh" type="button" data-act="refresh" aria-label="Refresh prices"><span class="spin" aria-hidden="true">↻</span></button>
-    <button class="btn" type="button" data-act="menu">Backup</button>
+    <button class="btn" type="button" data-act="menu" id="btn-sync">Backup</button>
     <button class="btn primary" id="btn-new-asset" type="button">+ New</button>
   </div>
 </header>
@@ -424,6 +425,7 @@ function donut(items, total){
 
 /* ---------- views ---------- */
 function exampleBanner(){
+  if(Y.cfg) return Y.state==='err' ? `<div class="banner"><span>Sync isn’t working: ${esc(Y.msg)}</span><span class="spacer"></span><button class="btn" type="button" data-act="menu">Open sync</button></div>` : '';
   if(!S.txns.size) return '';
   const m=loadMeta(); const WEEK=7*864e5;
   const unsaved = !m.lastBackup || (m.changedAt||0) > m.lastBackup;
@@ -565,18 +567,142 @@ function toast(msg){ const t=$('#toast'); t.textContent=msg; t.hidden=false; cle
 function writeErr(e){ toast(e && e.code==='quota_exceeded' ? 'Storage is full. Delete some old transactions and try again.' : 'Couldn’t save that change. Check your connection and try again.'); console.error(e); }
 /* Everything lives in this browser's storage under one key. Backup files are the safety net. */
 const KEY='stackLedger.v1', META='stackLedger.meta';
+/* Every record carries `u` (time of your last edit) and deletions leave a dated marker, so the phone and GitHub copies merge without losing anything. */
+S.deleted={};
+function stateBody(){ return {assets:[...S.assets.values()], txns:[...S.txns.values()], deleted:S.deleted}; }
 function persist(){
-  const body={assets:[...S.assets.values()], txns:[...S.txns.values()]};
+  const body=stateBody();
   try{ localStorage.setItem(KEY, JSON.stringify(body)); }
   catch(e){ toast('Couldn’t save on this device. Your browser storage may be full or blocked.'); console.error(e); return false; }
   return true;
 }
 function loadMeta(){ try{ return JSON.parse(localStorage.getItem(META)||'{}')||{}; }catch(_){ return {}; } }
 function saveMeta(patch){ const m={...loadMeta(),...patch}; try{ localStorage.setItem(META, JSON.stringify(m)); }catch(_){} return m; }
-function changed(){ saveMeta({changedAt:Date.now()}); }
-async function put(col,id,data){ S[col].set(id,{id,...data}); const ok=persist(); if(ok) changed(); route(); return ok; }
-async function patch(col,id,data){ S[col].set(id,{...S[col].get(id),...data}); const ok=persist(); if(ok) changed(); route(); return ok; }
-async function remove(col,id){ S[col].delete(id); const ok=persist(); if(ok) changed(); route(); return ok; }
+function changed(){ saveMeta({changedAt:Date.now()}); schedulePush(); }
+async function put(col,id,data){ S[col].set(id,{id,...data,u:Date.now()}); const ok=persist(); if(ok) changed(); route(); return ok; }
+async function patch(col,id,data){ S[col].set(id,{...S[col].get(id),...data,u:Date.now()}); const ok=persist(); if(ok) changed(); route(); return ok; }
+async function remove(col,id){ S[col].delete(id); S.deleted[col+':'+id]=Date.now(); const ok=persist(); if(ok) changed(); route(); return ok; }
+
+/* ---------- merge ---------- */
+function stable(v){ if(Array.isArray(v)) return '['+v.map(stable).join(',')+']'; if(v && typeof v==='object') return '{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',')+'}'; return JSON.stringify(v===undefined?null:v); }
+function canon(st){ const by=a=>[...a].filter(x=>x&&x.id).sort((x,y)=>x.id<y.id?-1:1); return stable({assets:by(st.assets||[]), txns:by(st.txns||[]), deleted:st.deleted||{}}); }
+/* Assets: your edits (name, unit, source…) go by whichever copy was edited last; price history from both copies is combined. */
+function mergeAsset(L,R){
+  const base=(R.u||0)>(L.u||0)?R:L;
+  const hist=new Map(); (base===L?[R,L]:[L,R]).forEach(x=>(x.history||[]).forEach(h=>{ if(h&&h.d) hist.set(h.d,{d:h.d,p:h.p}); }));
+  const history=[...hist.values()].sort((x,y)=>x.d<y.d?-1:1).slice(-3000);
+  const liveSrc=(R.liveAt||0)>(L.liveAt||0)?R:L, errSrc=(R.liveErrAt||0)>(L.liveErrAt||0)?R:L;
+  const out={...base, history, liveAt:liveSrc.liveAt||null, liveVia:liveSrc.liveVia||null, liveErr:errSrc.liveErr||null, liveErrAt:errSrc.liveErrAt||null};
+  const last=history[history.length-1]; if(last){ out.price=last.p; out.priceDate=last.d; }
+  return out;
+}
+function mergeInto(remote){
+  const del={...(remote.deleted||{})}; for(const [k,v] of Object.entries(S.deleted||{})) if(!((del[k]||0)>=v)) del[k]=v;
+  const yearAgo=Date.now()-365*864e5; for(const k of Object.keys(del)) if(del[k]<yearAgo) delete del[k];
+  for(const col of ['assets','txns']){
+    const rm=new Map((remote[col]||[]).filter(x=>x&&x.id).map(x=>[x.id,x]));
+    const ids=new Set([...S[col].keys(),...rm.keys()]);
+    for(const id of ids){
+      const L=S[col].get(id), R=rm.get(id);
+      let pick = !L ? R : !R ? L : col==='assets' ? mergeAsset(L,R) : ((R.u||0)>(L.u||0)?R:L);
+      const d=del[col+':'+id]; if(d && d>=(pick.u||0)) pick=null;
+      pick ? S[col].set(id,pick) : S[col].delete(id);
+    }
+  }
+  S.deleted=del;
+}
+
+/* ---------- GitHub sync (encrypted) ---------- */
+const SYNC_KEY='stackLedger.sync', SYNC_FILE='stack-ledger.json';
+const Y={cfg:null, state:'off', msg:'', timer:null, busy:false, again:false, k:null};
+function loadCfg(){ try{ const c=JSON.parse(localStorage.getItem(SYNC_KEY)||'null'); return c&&c.owner&&c.repo&&c.token&&c.pass?c:null; }catch(_){ return null; } }
+function saveCfg(c){ try{ c?localStorage.setItem(SYNC_KEY,JSON.stringify(c)):localStorage.removeItem(SYNC_KEY); }catch(_){} }
+const b64=buf=>{ const a=buf instanceof Uint8Array?buf:new Uint8Array(buf); let s=''; for(let i=0;i<a.length;i+=0x8000) s+=String.fromCharCode.apply(null,a.subarray(i,i+0x8000)); return btoa(s); };
+const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+async function keyFor(pass,saltB64){
+  if(Y.k && Y.k.pass===pass && Y.k.salt===saltB64) return Y.k.key;
+  const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:unb64(saltB64),iterations:250000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  Y.k={pass,salt:saltB64,key}; return key;
+}
+async function encryptState(obj,pass){
+  const salt = Y.k && Y.k.pass===pass ? Y.k.salt : b64(crypto.getRandomValues(new Uint8Array(16)));
+  const iv=crypto.getRandomValues(new Uint8Array(12)); const key=await keyFor(pass,salt);
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},key,new TextEncoder().encode(JSON.stringify(obj)));
+  return {app:'stack-ledger', v:1, kdf:'PBKDF2-SHA256-250000', cipher:'AES-GCM', salt, iv:b64(iv), data:b64(ct), savedAt:new Date().toISOString()};
+}
+async function decryptState(env,pass){
+  if(!env || env.app!=='stack-ledger' || !env.data) throw new Error('The '+SYNC_FILE+' file on GitHub isn’t Stack Ledger data.');
+  const key=await keyFor(pass,env.salt);
+  try{ const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:unb64(env.iv)},key,unb64(env.data)); return JSON.parse(new TextDecoder().decode(pt)); }
+  catch(_){ Y.k=null; const e=new Error('That passphrase doesn’t unlock the Stack Ledger data on GitHub. Use the passphrase you first set up sync with.'); e.code='pass'; throw e; }
+}
+function ghFetch(cfg,path,method,body){
+  return fetch('https://api.github.com/repos/'+encodeURIComponent(cfg.owner)+'/'+encodeURIComponent(cfg.repo)+path,{
+    method:method||'GET', cache:'no-store',
+    headers:{'Accept':'application/vnd.github+json','Authorization':'Bearer '+cfg.token,'X-GitHub-Api-Version':'2022-11-28',...(body?{'Content-Type':'application/json'}:{})},
+    body: body?JSON.stringify(body):undefined
+  });
+}
+async function ghError(r,cfg){
+  let m=''; try{ m=(await r.json()).message||''; }catch(_){}
+  if(r.status===401) return 'GitHub rejected the token. It may have expired. Make a new one and enter it under Sync.';
+  if(r.status===403||r.status===429) return /rate limit/i.test(m) ? 'GitHub is limiting requests right now. Sync will try again shortly.' : `The token can’t write to ${cfg.owner}/${cfg.repo}. It needs Contents: Read and write on that repo.`;
+  if(r.status===404) return `Couldn’t find ${cfg.owner}/${cfg.repo}. Check the username and repo name, and that the token has access to that repo.`;
+  return 'GitHub answered with error '+r.status+(m?': '+m:'')+'.';
+}
+function setSync(state,msg){
+  Y.state=state; Y.msg=msg||'';
+  const b=document.getElementById('btn-sync'); if(b){
+    b.textContent = state==='off' ? 'Backup' : state==='busy' ? 'Syncing…' : state==='ok' ? '✓ Synced' : '⚠ Sync';
+    b.classList.toggle('sync-err', state==='err');
+  }
+  const s=document.getElementById('m-status'); if(s) s.innerHTML=syncStatusHTML();
+  if(state==='err' || state==='ok') { const hb=document.getElementById('home-banner'); if(hb && !document.getElementById('view-home').hidden) hb.innerHTML=exampleBanner(); }
+}
+function schedulePush(){ if(!Y.cfg) return; clearTimeout(Y.timer); Y.timer=setTimeout(()=>syncNow(false),3000); }
+async function syncNow(manual, cfgOverride){
+  const cfg=cfgOverride||Y.cfg; if(!cfg) return false;
+  if(Y.busy){ Y.again=true; return false; }
+  if(!navigator.onLine){ setSync('err','You’re offline. Changes are saved on this phone and will sync when you’re back online.'); return false; }
+  Y.busy=true; setSync('busy'); clearTimeout(Y.timer); Y.timer=null;
+  try{
+    for(let attempt=0; ; attempt++){
+      if(attempt>=4) throw new Error('GitHub kept reporting a conflicting save. Tap Sync now to try again.');
+      const r=await ghFetch(cfg,'/contents/'+SYNC_FILE);
+      let remote=null, sha=null;
+      if(r.status===200){
+        const j=await r.json(); sha=j.sha;
+        let env; try{ env=JSON.parse(atob(String(j.content||'').replace(/\s/g,''))); }catch(_){ throw new Error('The '+SYNC_FILE+' file on GitHub isn’t readable.'); }
+        remote=await decryptState(env,cfg.pass);
+      } else if(r.status===404){
+        const rr=await ghFetch(cfg,''); if(!rr.ok) throw new Error(await ghError(rr,cfg));
+      } else throw new Error(await ghError(r,cfg));
+      if(remote){ const before=canon(stateBody()); mergeInto(remote); if(canon(stateBody())!==before){ persist(); route(); } }
+      if(remote && canon(remote)===canon(stateBody())) break;
+      const env=await encryptState(stateBody(),cfg.pass);
+      const put=await ghFetch(cfg,'/contents/'+SYNC_FILE,'PUT',{message:'Stack Ledger sync '+new Date().toISOString().slice(0,16).replace('T',' '), content:btoa(JSON.stringify(env)), ...(sha?{sha}:{})});
+      if(put.status===409 || put.status===422) continue;
+      if(!put.ok) throw new Error(await ghError(put,cfg));
+      break;
+    }
+    saveMeta({lastSync:Date.now()}); setSync('ok');
+    if(manual) toast('Synced with GitHub.');
+    return true;
+  }catch(e){
+    const msg = e.name==='TypeError' ? 'Couldn’t reach GitHub. Changes are saved on this phone and will sync next time.' : (e.message||'Sync failed.');
+    setSync('err',msg); if(manual) toast(msg); if(cfgOverride) throw new Error(msg);
+    return false;
+  }finally{
+    Y.busy=false; if(Y.again){ Y.again=false; schedulePush(); }
+  }
+}
+function syncStatusHTML(){
+  if(!Y.cfg) return '';
+  const m=loadMeta();
+  const line = Y.state==='busy' ? 'Syncing…' : Y.state==='err' ? esc(Y.msg) : m.lastSync ? 'Last synced '+esc(ago(m.lastSync)) : 'Not synced yet';
+  return `<div class="live ${Y.state==='err'?'err':''}"><span class="dot"></span>${line}</div><div class="hint">Saving to <b>${esc(Y.cfg.owner)}/${esc(Y.cfg.repo)}</b> as ${SYNC_FILE}, encrypted with your passphrase.</div>`;
+}
 function withPrice(a,p,d){
   const hist=(a.history||[]).filter(h=>h.d!==d).map(h=>({d:h.d,p:h.p})).concat([{d,p}]).sort((x,y)=>x.d<y.d?-1:1).slice(-3000);
   const latest=hist[hist.length-1];
@@ -670,14 +796,14 @@ async function refreshPrices(manual, onlyId){
       const cur=S.assets.get(a.id); if(cur) S.assets.set(a.id,{...cur, liveErr: e.name==='AbortError' ? 'The price source took too long to answer.' : (e.message && !/^HTTP|fetch|network/i.test(e.message) ? e.message : 'Couldn’t reach the price source.'), liveErrAt:Date.now()}); bad++;
     }
   }
-  persist(); if(!onlyId) saveMeta({lastRefresh:Date.now()});
+  persist(); if(!onlyId) saveMeta({lastRefresh:Date.now()}); if(ok) schedulePush();
   refreshing=false; document.getElementById('btn-refresh').classList.remove('spinning'); route();
   if(manual) toast(bad ? `Updated ${ok} of ${ok+bad} prices. Open an asset to see what failed.` : `Updated ${ok} price${ok===1?'':'s'}.`);
 }
 function ago(ts){ const s=(Date.now()-ts)/1000; if(s<60) return 'just now'; if(s<3600) return Math.round(s/60)+' min ago'; if(s<86400) return Math.round(s/3600)+' hr ago'; return Math.round(s/86400)+' days ago'; }
 
 /* ---------- backup files ---------- */
-function backupBody(){ return {app:'stack-ledger', version:1, exportedAt:new Date().toISOString(), assets:[...S.assets.values()], txns:[...S.txns.values()]}; }
+function backupBody(){ return {app:'stack-ledger', version:1, exportedAt:new Date().toISOString(), ...stateBody()}; }
 async function saveBackup(){
   const name='stack-ledger-backup-'+todayStr()+'.json';
   const blob=new Blob([JSON.stringify(backupBody(),null,1)],{type:'application/json'});
@@ -696,16 +822,35 @@ function readBackup(file){
   return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>{ try{ const d=JSON.parse(r.result); if(!d || !Array.isArray(d.assets) || !Array.isArray(d.txns)) throw 0; res(d); }catch(_){ rej(new Error('That file isn’t a Stack Ledger backup.')); } }; r.onerror=()=>rej(new Error('Couldn’t read that file.')); r.readAsText(file); });
 }
 function restoreFrom(d){
-  S.assets=new Map(d.assets.filter(a=>a&&a.id).map(a=>[a.id,a]));
-  S.txns=new Map(d.txns.filter(t=>t&&t.id&&t.assetId).map(t=>[t.id,t]));
-  if(persist()){ saveMeta({lastBackup:Date.now(), changedAt:Date.now()-1}); location.hash='home'; route(); toast(`Restored ${S.assets.size} assets and ${S.txns.size} transactions.`); }
+  const now=Date.now();
+  S.assets=new Map(d.assets.filter(a=>a&&a.id).map(a=>[a.id,{...a,u:now}]));
+  S.txns=new Map(d.txns.filter(t=>t&&t.id&&t.assetId).map(t=>[t.id,{...t,u:now}]));
+  S.deleted={};
+  if(persist()){ saveMeta({lastBackup:now, changedAt:now-1}); schedulePush(); location.hash='home'; route(); toast(`Restored ${S.assets.size} assets and ${S.txns.size} transactions.`); }
 }
 function menuModal(){
-  const m=loadMeta();
-  openModal(`<h2>Backup</h2><div class="form">
-    <p class="hint" style="margin:0">Your data is stored only in this browser. Save a backup file now and then, especially before clearing browser data or switching phones.</p>
+  const m=loadMeta(), c=Y.cfg;
+  const syncPart = c ? `
+    <div id="m-status">${syncStatusHTML()}</div>
+    <div class="actions"><button class="btn primary" type="button" id="m-syncnow">Sync now</button><span class="spacer"></span><button class="btn danger" type="button" id="m-off">Turn off sync on this phone</button></div>`
+  : `
+    <p class="hint" style="margin:0">Save your data to a private GitHub repo, encrypted with a passphrase, so clearing your cache or switching phones doesn’t lose anything. You can use the same <b>freecash-data</b> repo and token as your budget app. Stack Ledger saves its own file there, <b>${SYNC_FILE}</b>, next to the budget file.</p>
+    <form class="form" id="m-sync" autocomplete="off" style="padding:0">
+      <div class="two"><div class="field"><label for="s-owner">GitHub username</label><input id="s-owner" type="text" autocapitalize="off" spellcheck="false" value="andrewh1492"></div>
+      <div class="field"><label for="s-repo">Data repo</label><input id="s-repo" type="text" autocapitalize="off" spellcheck="false" value="freecash-data"></div></div>
+      <div class="field"><label for="s-token">Token</label><input id="s-token" type="password" autocapitalize="off" spellcheck="false" placeholder="github_pat_…"></div>
+      <div class="field"><label for="s-pass">Passphrase</label><input id="s-pass" type="password" autocapitalize="off" spellcheck="false" placeholder="At least 8 characters"><span class="hint">Choose one now, or use the one you use for the budget app. If you’re reconnecting after a cache clear, enter the same passphrase you used before.</span></div>
+      <div class="err" id="s-err"></div>
+      <div class="actions"><span class="spacer"></span><button class="btn primary" type="submit" id="s-go">Turn on sync</button></div>
+    </form>`;
+  openModal(`<h2>Sync &amp; backup</h2><div class="form">
+    <span class="label">GitHub sync</span>
+    ${syncPart}
+    <hr style="border:0;border-top:1px solid var(--line);margin:4px 0;width:100%">
+    <span class="label">Backup file</span>
+    <p class="hint" style="margin:0">${c?'Optional with sync on. A file copy you keep yourself.':'Without sync, your data is stored only in this browser. Save a backup file now and then.'}</p>
     <div class="menu-list">
-      <button class="btn primary" type="button" id="m-save">Save backup file <small style="color:inherit;opacity:.8">${m.lastBackup?'last '+esc(ago(m.lastBackup)):'never saved'}</small></button>
+      <button class="btn ${c?'':'primary'}" type="button" id="m-save">Save backup file <small style="color:inherit;opacity:.8">${m.lastBackup?'last '+esc(ago(m.lastBackup)):'never saved'}</small></button>
       <label class="btn" for="m-file" style="cursor:pointer">Restore from a backup file…<input id="m-file" type="file" accept=".json,application/json" style="position:absolute;width:1px;height:1px;opacity:0;overflow:hidden"></label>
     </div>
     <div id="m-confirm"></div>
@@ -713,6 +858,25 @@ function menuModal(){
   </div>`, sh=>{
     sh.querySelector('#m-close').onclick=closeModal;
     sh.querySelector('#m-save').onclick=()=>{ closeModal(); saveBackup(); };
+    const now=sh.querySelector('#m-syncnow'); if(now) now.onclick=()=>syncNow(true);
+    const off=sh.querySelector('#m-off'); if(off) off.onclick=()=>{
+      if(!off.classList.contains('armed')){ off.classList.add('armed'); off.textContent='Confirm: stop syncing this phone'; return; }
+      Y.cfg=null; Y.k=null; saveCfg(null); setSync('off'); closeModal(); route(); toast('Sync turned off. Your data on GitHub is still there.');
+    };
+    const f=sh.querySelector('#m-sync'); if(f) f.onsubmit=async e=>{
+      e.preventDefault(); const err=sh.querySelector('#s-err'), go=sh.querySelector('#s-go'); err.textContent='';
+      const cfg={owner:sh.querySelector('#s-owner').value.trim().replace(/^@/,''), repo:sh.querySelector('#s-repo').value.trim(), token:sh.querySelector('#s-token').value.trim(), pass:sh.querySelector('#s-pass').value};
+      if(!/^[A-Za-z0-9-]+$/.test(cfg.owner)) return err.textContent='Enter your GitHub username.';
+      if(!/^[A-Za-z0-9._-]+$/.test(cfg.repo)) return err.textContent='Enter the name of your private data repo.';
+      if(!/^(github_pat_|ghp_)/.test(cfg.token)) return err.textContent='Paste your GitHub token. It starts with github_pat_.';
+      if(cfg.pass.length<8) return err.textContent='The passphrase needs at least 8 characters.';
+      go.disabled=true; go.textContent='Connecting…';
+      try{
+        await syncNow(false,cfg);
+        Y.cfg=cfg; saveCfg(cfg); setSync('ok'); closeModal(); route();
+        toast(`Sync is on. ${S.txns.size} transaction${S.txns.size===1?'':'s'} saved to GitHub.`);
+      }catch(ex){ Y.k=null; setSync(Y.cfg?'err':'off'); err.textContent=ex.message; go.disabled=false; go.textContent='Turn on sync'; }
+    };
     sh.querySelector('#m-file').onchange=async e=>{
       const f=e.target.files[0]; if(!f) return; const box=sh.querySelector('#m-confirm');
       try{
@@ -871,14 +1035,21 @@ function boot(){
   if(d && Array.isArray(d.assets)){
     S.assets=new Map(d.assets.filter(a=>a&&a.id).map(a=>[a.id,a]));
     S.txns=new Map((d.txns||[]).filter(t=>t&&t.id).map(t=>[t.id,t]));
+    S.deleted=d.deleted||{};
   } else if(!raw){
-    STARTER.forEach(a=>S.assets.set(a.id,{...a})); persist();
+    STARTER.forEach(a=>S.assets.set(a.id,{...a,u:0})); persist();
   }
+  Y.cfg=loadCfg(); setSync(Y.cfg?'busy':'off');
   S.mode='ready'; route();
   try{ navigator.storage && navigator.storage.persist && navigator.storage.persist(); }catch(_){}
   const stale=()=>Date.now()-(loadMeta().lastRefresh||0) > 10*60*1000;
-  if(stale()) refreshPrices(false);
-  document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible' && stale()) refreshPrices(false); });
+  /* Pull from GitHub first, then refresh prices, so a fresh install never pushes over your saved data. */
+  (async()=>{ if(Y.cfg) await syncNow(false); if(stale()) refreshPrices(false); })();
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState!=='visible') { if(Y.cfg && Y.timer) syncNow(false); return; }
+    (async()=>{ if(Y.cfg && Date.now()-(loadMeta().lastSync||0) > 60*1000) await syncNow(false); if(stale()) refreshPrices(false); })();
+  });
+  window.addEventListener('online',()=>{ if(Y.cfg) syncNow(false); });
 }
 boot();
 })();
